@@ -1,5 +1,5 @@
 import os, re, sqlite3, threading, time, logging, queue, json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
@@ -15,11 +15,19 @@ logging.basicConfig(level=logging.INFO)
 priority = queue.Queue()
 queued = set()
 queue_lock = threading.Lock()
+wake = threading.Event()
+last_queued = {}
+last_activity = 0
+
+def normalize(value):
+    value = (value or '').casefold().replace('ё', 'е')
+    aliases = {'гта': 'gta', 'диабло': 'diablo', 'спотифай': 'spotify', 'спотифи': 'spotify'}
+    return ' '.join(aliases.get(word, word) for word in re.findall(r'[\w]+', value))
 
 def db():
     c = sqlite3.connect(DB, timeout=30)
     c.row_factory = sqlite3.Row
-    c.create_function("casefold", 1, lambda x: (x or "").casefold(), deterministic=True)
+    c.create_function("casefold", 1, normalize, deterministic=True)
     return c
 
 def init():
@@ -29,7 +37,7 @@ def init():
         CREATE TABLE IF NOT EXISTS listings (url TEXT PRIMARY KEY, category_url TEXT, title TEXT, price TEXT, seller TEXT, online INTEGER, updated TEXT);
         CREATE INDEX IF NOT EXISTS idx_listing_category ON listings(category_url);
         CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);''')
-        for table, col, typ in [('categories','filters','TEXT'), ('listings','attributes','TEXT'), ('listings','position','INTEGER'), ('listings','price_num','REAL')]:
+        for table, col, typ in [('categories','filters','TEXT'), ('categories','source_count','INTEGER'), ('listings','attributes','TEXT'), ('listings','position','INTEGER'), ('listings','price_num','REAL')]:
             if col not in [x['name'] for x in c.execute(f'PRAGMA table_info({table})')]:
                 c.execute(f'ALTER TABLE {table} ADD COLUMN {col} {typ}')
 
@@ -66,8 +74,11 @@ def crawl(session, cat):
             label = text(select.select_one('option')) or fid
         else:
             options = [{'value': b.get('value', '').lower(), 'label': text(b)} for b in field.select('button[value]') if b.get('value')]
-            label = fid
+            label = {'type':'Тип', 'server':'Сервер', 'platform':'Платформа', 'region':'Регион', 'side':'Сторона', 'time':'Срок'}.get(fid, fid.replace('_',' ').replace('-',' ').capitalize())
         if options: filters.append({'id': fid, 'label': label, 'options': options})
+    counter = text(soup.select_one('.counter-item.active .counter-value'))
+    digits = re.sub(r'[^0-9]', '', counter)
+    source_count = int(digits) if digits else None
     items = []
     for position, a in enumerate(soup.select('a.tc-item[href]')):
         url = urljoin(BASE, a['href'])
@@ -85,8 +96,21 @@ def crawl(session, cat):
     with db() as c:
         c.execute('DELETE FROM listings WHERE category_url=?', (cat['url'],))
         c.executemany('INSERT OR REPLACE INTO listings (url,category_url,title,price,seller,online,updated,attributes,position,price_num) VALUES (?,?,?,?,?,?,?,?,?,?)', items)
-        c.execute('UPDATE categories SET updated=?, error=NULL, filters=? WHERE url=?', (now(),json.dumps(filters, ensure_ascii=False),cat['url']))
+        c.execute('UPDATE categories SET updated=?, error=NULL, filters=?, source_count=? WHERE url=?', (now(),json.dumps(filters, ensure_ascii=False),source_count,cat['url']))
         state(c,'last_update',now())
+
+def enqueue(cat, force=False):
+    global last_activity
+    last_activity = time.monotonic()
+    with queue_lock:
+        url = cat['url']
+        if url in queued or (not force and time.monotonic() - last_queued.get(url, -1000) < 120):
+            return False
+        queued.add(url)
+        last_queued[url] = time.monotonic()
+        priority.put(dict(cat))
+        wake.set()
+        return True
 
 def worker():
     session = requests.Session()
@@ -99,10 +123,13 @@ def worker():
             while cats or not priority.empty():
                 try:
                     cat = priority.get_nowait()
-                    with queue_lock: queued.discard(cat['url'])
                     cats = [x for x in cats if x['url'] != cat['url']]
                 except queue.Empty:
                     if not cats: break
+                    if time.monotonic() - last_activity < 30:
+                        wake.wait(2)
+                        wake.clear()
+                        continue
                     cat = cats.pop(0)
                 try: crawl(session,cat)
                 except Exception as e:
@@ -112,23 +139,36 @@ def worker():
                         state(c,'last_error',str(e)[:300])
                     if isinstance(e, requests.HTTPError) and e.response is not None and e.response.status_code == 429:
                         app.logger.warning('FunPay rate limit; waiting 60 seconds')
+                        with db() as c: state(c, 'cooldown_until', (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat())
                         time.sleep(60)
+                finally:
+                    with queue_lock: queued.discard(cat['url'])
                 time.sleep(DELAY)
             with db() as c: state(c,'last_cycle',now())
         except Exception as e:
             app.logger.exception('Discovery failed')
             with db() as c: state(c,'last_error',str(e)[:300])
-        time.sleep(INTERVAL)
+        wake.wait(INTERVAL)
+        wake.clear()
 
 @app.get('/')
 def index(): return render_template('index.html')
 
 @app.get('/api/categories')
 def categories():
-    q = request.args.get('q','').strip().casefold()[:200]
+    q = normalize(request.args.get('q','').strip()[:200])
     with db() as c:
         rows = c.execute('SELECT url,game,name,updated,filters FROM categories WHERE casefold(game) LIKE ? OR casefold(name) LIKE ? ORDER BY game,name LIMIT 100', ('%'+q+'%', '%'+q+'%')).fetchall() if q else []
     return jsonify([dict(x) for x in rows])
+
+@app.post('/api/refresh')
+def refresh_category():
+    category = (request.get_json(silent=True) or {}).get('category', '')
+    with db() as c:
+        row = c.execute('SELECT * FROM categories WHERE url=?', (category,)).fetchone()
+    if not row: return jsonify(error='Категория не найдена'), 404
+    enqueue(row, force=True)
+    return jsonify(queued=True)
 
 @app.get('/api/listings')
 def listings():
@@ -138,9 +178,13 @@ def listings():
     category = request.args.get('category','').strip()[:200]
     sort = request.args.get('sort','source')
     where, args = [], []
-    if q:
-        where.append('(casefold(l.title) LIKE ? OR casefold(c.game) LIKE ? OR casefold(c.name) LIKE ?)')
-        args += ['%'+q.casefold()+'%']*3
+    for word in normalize(q).split():
+        if category:
+            where.append('casefold(l.title) LIKE ?')
+            args.append('%'+word+'%')
+        else:
+            where.append('(casefold(l.title) LIKE ? OR casefold(c.game) LIKE ? OR casefold(c.name) LIKE ?)')
+            args += ['%'+word+'%']*3
     if game: where.append('c.game = ?'); args.append(game)
     if category: where.append('c.url = ?'); args.append(category)
     if request.args.get('online') == '1': where.append('l.online = 1')
@@ -157,18 +201,20 @@ def listings():
     with db() as c:
         pending = []
         if category:
-            pending = [dict(x) for x in c.execute('SELECT * FROM categories WHERE url=? AND (updated IS NULL OR filters IS NULL)', (category,))]
+            row = c.execute('SELECT * FROM categories WHERE url=?', (category,)).fetchone()
+            if row:
+                stale = not row['updated'] or not row['filters'] or (datetime.now(timezone.utc) - datetime.fromisoformat(row['updated'])).total_seconds() > 120
+                if stale: enqueue(row)
+                with queue_lock:
+                    if category in queued: pending = [dict(row)]
         elif len(q) >= 2:
-            pending = [dict(x) for x in c.execute('SELECT * FROM categories WHERE updated IS NULL AND error IS NULL AND (casefold(game) LIKE ? OR casefold(name) LIKE ?) LIMIT 50', ('%'+q.casefold()+'%', '%'+q.casefold()+'%'))]
-        with queue_lock:
-            for cat in pending:
-                if cat['url'] not in queued:
-                    queued.add(cat['url'])
-                    priority.put(cat)
+            pending = [dict(x) for x in c.execute('SELECT * FROM categories WHERE updated IS NULL AND error IS NULL AND (casefold(game) LIKE ? OR casefold(name) LIKE ?) LIMIT 50', ('%'+normalize(q)+'%', '%'+normalize(q)+'%'))]
+        if not category:
+            for cat in pending: enqueue(cat)
         total = c.execute('SELECT COUNT(*) FROM listings l JOIN categories c ON c.url=l.category_url'+clause,args).fetchone()[0]
         order = {'source': 'COALESCE(l.position, 999999), l.url', 'price_asc': 'l.price_num IS NULL, l.price_num ASC, l.url', 'price_desc': 'l.price_num IS NULL, l.price_num DESC, l.url'}.get(sort, 'COALESCE(l.position, 999999), l.url')
         rows = c.execute('SELECT l.*, c.game, c.name AS category FROM listings l JOIN categories c ON c.url=l.category_url'+clause+' ORDER BY '+order+' LIMIT 40 OFFSET ?',args+[(page-1)*40]).fetchall()
-        selected = c.execute('SELECT filters,updated,error FROM categories WHERE url=?',(category,)).fetchone() if category else None
+        selected = c.execute('SELECT filters,updated,error,source_count FROM categories WHERE url=?',(category,)).fetchone() if category else None
         status = dict(c.execute('SELECT key,value FROM state').fetchall())
         stats = dict(c.execute('SELECT COUNT(*) AS categories, COUNT(updated) AS updated, SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS errors FROM categories').fetchone())
     return jsonify(items=[dict(x) for x in rows],total=total,page=page,status=status,stats=stats,pending=len(pending),selected=dict(selected) if selected else None)
