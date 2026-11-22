@@ -3,6 +3,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
+COPY price_viewer price_viewer
 COPY templates templates
 COPY static static
 ENV DB_PATH=/data/listings.db PYTHONUNBUFFERED=1

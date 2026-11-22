@@ -6,6 +6,8 @@ services:
     volumes:
       - price_data:/data
     environment:
+      LOLZ_TOKEN: ${LOLZ_TOKEN:-}
+      CRAWL_BACKGROUND: ${CRAWL_BACKGROUND:-0}
       CRAWL_DELAY: ${CRAWL_DELAY:-1}
       CRAWL_INTERVAL: ${CRAWL_INTERVAL:-300}
     restart: unless-stopped
