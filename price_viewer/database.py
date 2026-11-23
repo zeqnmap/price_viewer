@@ -6,8 +6,16 @@ from .search import normalize
 
 os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
 
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def db():
-    c = sqlite3.connect(DB_PATH, timeout=30)
+    c = sqlite3.connect(DB_PATH, timeout=30, factory=ClosingConnection)
     c.row_factory = sqlite3.Row
     c.create_function("casefold", 1, normalize, deterministic=True)
     return c
@@ -19,7 +27,7 @@ def init():
         CREATE TABLE IF NOT EXISTS listings (url TEXT PRIMARY KEY, category_url TEXT, title TEXT, price TEXT, seller TEXT, online INTEGER, updated TEXT);
         CREATE INDEX IF NOT EXISTS idx_listing_category ON listings(category_url);
         CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);''')
-        for table, col, typ in [('categories','slug','TEXT'), ('categories','search_game','TEXT'), ('categories','search_name','TEXT'), ('listings','search_title','TEXT'), ('listings','seller_rating','REAL'), ('listings','seller_review_count','INTEGER'), ('listings','seller_positive','INTEGER'), ('listings','seller_negative','INTEGER'), ('categories','filters','TEXT'), ('categories','source_count','INTEGER'), ('listings','attributes','TEXT'), ('listings','position','INTEGER'), ('listings','price_num','REAL'), ('listings','source','TEXT NOT NULL DEFAULT \"funpay\"')]:
+        for table, col, typ in [('categories','rating_checked','TEXT'), ('categories','slug','TEXT'), ('categories','search_game','TEXT'), ('categories','search_name','TEXT'), ('listings','search_title','TEXT'), ('listings','seller_rating','REAL'), ('listings','seller_review_count','INTEGER'), ('listings','seller_positive','INTEGER'), ('listings','seller_negative','INTEGER'), ('categories','filters','TEXT'), ('categories','source_count','INTEGER'), ('listings','attributes','TEXT'), ('listings','position','INTEGER'), ('listings','price_num','REAL'), ('listings','source','TEXT NOT NULL DEFAULT \"funpay\"')]:
             if col not in [x['name'] for x in c.execute(f'PRAGMA table_info({table})')]:
                 c.execute(f'ALTER TABLE {table} ADD COLUMN {col} {typ}')
         c.execute('UPDATE categories SET search_game=casefold(game), search_name=casefold(name) WHERE search_game IS NULL OR search_name IS NULL')

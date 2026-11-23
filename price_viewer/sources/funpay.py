@@ -66,6 +66,6 @@ def crawl(session, cat):
     with db() as c:
         c.execute('DELETE FROM listings WHERE category_url=?', (cat['url'],))
         c.executemany('INSERT OR REPLACE INTO listings (url,category_url,title,price,seller,online,updated,attributes,position,price_num,seller_rating,seller_review_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', items)
-        c.execute('UPDATE categories SET updated=?, error=NULL, filters=?, source_count=? WHERE url=?', (now(),json.dumps(filters, ensure_ascii=False),source_count,cat['url']))
+        c.execute('UPDATE categories SET updated=?, rating_checked=?, error=NULL, filters=?, source_count=? WHERE url=?', (now(),now(),json.dumps(filters, ensure_ascii=False),source_count,cat['url']))
         state(c,'last_update',now())
 

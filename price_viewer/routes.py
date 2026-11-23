@@ -1,10 +1,12 @@
 import re
+import math
 from datetime import datetime, timezone
 from flask import Blueprint, jsonify, render_template, request
 from .database import db
 from .search import normalize
+from .matching import matches
 from .worker import enqueue, queue_lock, queued
-from .sources import lolz, playerok
+from .sources import lolz, playerok, plati
 
 bp = Blueprint("site", __name__)
 
@@ -18,7 +20,8 @@ def sources():
     return jsonify([
         {'id':'funpay','name':'FunPay','status':'active','count':stats['n'],'updated':stats['updated']},
         lolz.status(),
-        playerok.status()
+        playerok.status(),
+        plati.status()
     ])
 
 @bp.get('/api/categories')
@@ -49,6 +52,8 @@ def refresh_category():
     with db() as c:
         row = c.execute('SELECT * FROM categories WHERE url=?', (category,)).fetchone()
     if not row: return jsonify(error='Категория не найдена'), 404
+    if row['url'].startswith('https://plati.market/'):
+        return jsonify(error='Обновите результаты текстового поиска'), 400
     if row['url'].startswith('https://lzt.market/'):
         lolz.search('', row['slug'])
     elif row['url'].startswith('https://playerok.com/'):
@@ -67,10 +72,16 @@ def listings():
     source = request.args.get('source','')
     with db() as c:
         category_row = c.execute('SELECT * FROM categories WHERE url=?', (category,)).fetchone() if category else None
+    with db() as c:
+        all_categories = c.execute('SELECT * FROM categories').fetchall() if category_row else []
+    matched = [row for row in all_categories if matches(category_row, row)] if category_row else []
+    # Search other sources by the game name to discover categories not yet cached.
+    game_query = (category_row['name'] if category_row['url'].startswith('https://lzt.market/') else category_row['game']) if category_row else ''
     is_lolz_category = bool(category_row and category_row['url'].startswith('https://lzt.market/'))
     is_playerok_category = bool(category_row and category_row['url'].startswith('https://playerok.com/'))
-    playerok_search = playerok.search(q, category_row['slug']) if is_playerok_category else playerok.search(q) if not category and source in ('', 'playerok') else {'state': 'idle'}
-    lolz_search = lolz.search(q, category_row['slug']) if is_lolz_category else lolz.search(q) if not category and source in ('', 'lolz') else {'state': 'idle'}
+    playerok_search = playerok.search(q, category_row['slug']) if is_playerok_category and source in ('', 'playerok') else playerok.search(game_query if category else q) if source in ('', 'playerok') else {'state': 'idle'}
+    lolz_search = lolz.search(q, category_row['slug']) if is_lolz_category and source in ('', 'lolz') else lolz.search(game_query if category else q) if source in ('', 'lolz') else {'state': 'idle'}
+    plati_search = plati.search(game_query if category else q) if source in ('', 'plati') else {'state': 'idle'}
     where, args = [], []
     for word in normalize(q).split():
         if category:
@@ -84,8 +95,10 @@ def listings():
                 where.append('(l.search_title LIKE ? OR c.search_game LIKE ? OR c.search_name LIKE ?)')
                 args += ['%'+word+'%']*3
     if game: where.append('c.game = ?'); args.append(game)
-    if category: where.append('c.url = ?'); args.append(category)
-    if source in ('funpay','lolz','playerok'): where.append('l.source = ?'); args.append(source)
+    if category:
+        urls = [row['url'] for row in matched] or [category]
+        where.append('c.url IN (' + ','.join('?' for _ in urls) + ')'); args.extend(urls)
+    if source in ('funpay','lolz','playerok','plati'): where.append('l.source = ?'); args.append(source)
     if request.args.get('online') == '1': where.append('l.online = 1')
     for key, value in request.args.items():
         if key.startswith('f-') and re.fullmatch(r'f-[a-zA-Z0-9_-]+',key) and value:
@@ -94,18 +107,20 @@ def listings():
     for key, op in [('min_price','>='),('max_price','<=')]:
         try:
             val = float(request.args.get(key,''))
-            where.append('l.price_num '+op+' ?'); args.append(val)
+            if math.isfinite(val) and val >= 0:
+                where.append('l.price_num '+op+' ?'); args.append(val)
         except ValueError: pass
     clause = ' WHERE '+' AND '.join(where) if where else ''
     with db() as c:
         pending = []
-        if category and not is_lolz_category and not is_playerok_category:
-            row = c.execute('SELECT * FROM categories WHERE url=?', (category,)).fetchone()
-            if row:
+        if category:
+            for row in matched:
+                if not row['url'].startswith('https://funpay.com/') or source not in ('', 'funpay'):
+                    continue
                 stale = not row['updated'] or not row['filters'] or (datetime.now(timezone.utc) - datetime.fromisoformat(row['updated'])).total_seconds() > 120
                 if stale: enqueue(row)
                 with queue_lock:
-                    if category in queued: pending = [dict(row)]
+                    if row['url'] in queued: pending.append(dict(row))
         elif not category and len(q) >= 2 and source in ('', 'funpay'):
             pending = [dict(x) for x in c.execute("SELECT * FROM categories WHERE url LIKE 'https://funpay.com/%' AND updated IS NULL AND error IS NULL AND (search_game LIKE ? OR search_name LIKE ?) LIMIT 3", ('%'+normalize(q)+'%', '%'+normalize(q)+'%'))]
         if not category:
@@ -113,7 +128,17 @@ def listings():
         total = c.execute('SELECT COUNT(*) FROM listings l JOIN categories c ON c.url=l.category_url'+clause,args).fetchone()[0]
         order = {'source': 'COALESCE(l.position, 999999), l.url', 'price_asc': 'l.price_num IS NULL, l.price_num ASC, l.url', 'price_desc': 'l.price_num IS NULL, l.price_num DESC, l.url'}.get(sort, 'COALESCE(l.position, 999999), l.url')
         rows = c.execute('SELECT l.*, c.game, c.name AS category FROM listings l JOIN categories c ON c.url=l.category_url'+clause+' ORDER BY '+order+' LIMIT 40 OFFSET ?',args+[(page-1)*40]).fetchall()
+        # Refresh old cached FunPay categories once to populate seller ratings.
+        old_urls = list(dict.fromkeys(row['category_url'] for row in rows if row['source'] == 'funpay'))
+        if old_urls:
+            placeholders = ','.join('?' for _ in old_urls)
+            old_categories = c.execute('SELECT * FROM categories WHERE rating_checked IS NULL AND url IN (' + placeholders + ')', old_urls).fetchall()
+            for old in old_categories[:3]:
+                enqueue(old)
+                with queue_lock:
+                    if old['url'] in queued and not any(p['url'] == old['url'] for p in pending):
+                        pending.append(dict(old))
         selected = c.execute('SELECT filters,updated,error,source_count,slug FROM categories WHERE url=?',(category,)).fetchone() if category else None
         status = dict(c.execute('SELECT key,value FROM state').fetchall())
         stats = dict(c.execute('SELECT COUNT(*) AS categories, COUNT(updated) AS updated, SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS errors FROM categories WHERE url LIKE \"https://funpay.com/%\"').fetchone())
-    return jsonify(items=[dict(x) for x in rows],total=total,page=page,status=status,stats=stats,pending=len(pending),selected=dict(selected) if selected else None, lolz_search=lolz_search,playerok_search=playerok_search)
+    return jsonify(items=[dict(x) for x in rows],total=total,page=page,status=status,stats=stats,pending=len(pending),selected=dict(selected) if selected else None, lolz_search=lolz_search,playerok_search=playerok_search, plati_search=plati_search, matched_categories=[{'url': row['url'], 'game': row['game'], 'name': row['name']} for row in matched])
